@@ -1,0 +1,12 @@
+# Machine-specific local configuration (never commit)
+locals.txt
+
+# Agent local overrides (machine-specific, must not be committed)
+AGENTS.local.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
