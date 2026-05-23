@@ -5,3 +5,10 @@
 PYTHON=..\lexi\demos\venv\Scripts\python.exe
 VERSHOLN_DIR=..\versholn
 AGENT_STANDARDS_DIR=..\nielsoln_agent_standards
+# GitHub race-protected job numbering (optional).
+# Generate a fine-grained token at: GitHub > Settings > Developer settings >
+# Personal access tokens > Fine-grained tokens.
+# Required permission: Contents - Read and write (this repo only).
+# If absent, next_job falls back to local state.json update.
+# GITHUB_REPO is auto-detected from the git remote -- no need to set it.
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx

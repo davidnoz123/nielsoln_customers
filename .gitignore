@@ -10,3 +10,18 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+
+# REPL session files (machine-specific, never commit)
+repl_logs/
+.repl_terminal_id_*
+
+# Customer job documents (contain personal data, never commit)
+jobs/
+
+# Stray root-level Word documents (templates live in templates/)
+/*.docx
+
+# Generated template versions and sample fills (built by build_template / fill_sample)
+templates/*_v*.docx
+templates/*_sample*.docx
+.repl_terminal_id_*
