@@ -468,6 +468,11 @@ class WordDriver:
 
         Replaces any existing image in the CC.  The image is saved into the
         document (LinkToFile=False).  Returns True if the tag was found.
+
+        Note: Word raises 'selection partially covers a plain text content
+        control' if the document has an active cursor inside a text CC when
+        this is called.  Use insert_picture_at_tag() instead for signature
+        fields — it deletes the CC first, bypassing the guard entirely.
         """
         for cc in self._doc.ContentControls:
             if cc.Tag == tag:
@@ -480,6 +485,69 @@ class WordDriver:
                     SaveWithDocument=True,
                 )
                 return True
+        return False
+
+    def insert_picture_at_tag(self, tag: str, image_path: str,
+                              max_width_pt: float = 515.3,
+                              max_height_pt: float = 49.6) -> bool:
+        """Insert a picture at a content control or bookmark identified by *tag*.
+
+        Designed for signature fields where Word's AddPicture guard fires on
+        picture CCs adjacent to text CCs.
+
+        Strategy:
+        - If a bookmark named *tag* already exists (re-sign): insert directly.
+        - Otherwise find the picture CC, delete it (removes the guard), add a
+          bookmark named *tag* at that position, then insert the picture.
+
+        The image is scaled down to fit within *max_width_pt* x *max_height_pt*
+        (points; 72 pt = 1 inch) while preserving aspect ratio.  It is never
+        upscaled.  The bookmark persists after insertion, so re-signing works.
+        Returns True if the tag was found (as CC or bookmark).
+        """
+        def _fit(shape):
+            w, h = float(shape.Width), float(shape.Height)
+            if w > 0 and h > 0:
+                scale = min(max_width_pt / w, max_height_pt / h, 1.0)
+                shape.LockAspectRatio = -1   # wdTrue
+                shape.Width = w * scale
+            shape.Range.InsertAfter("\r")    # new paragraph after signature
+
+        # ── Re-sign: bookmark already present from a previous signature ──────
+        if self._doc.Bookmarks.Exists(tag):
+            bm_start = self._doc.Bookmarks(tag).Range.Start
+            # Expand to the full paragraph so we catch the picture even if the
+            # bookmark didn't grow to include it after the previous insertion.
+            para_rng = self._doc.Range(bm_start, bm_start)
+            para_rng.Expand(1)   # wdParagraph = 1
+            for i in range(para_rng.InlineShapes.Count, 0, -1):
+                para_rng.InlineShapes(i).Delete()
+            # Refresh bookmark (deletion may have shifted it)
+            fresh_rng = self._doc.Range(bm_start, bm_start)
+            self._doc.Bookmarks.Add(tag, fresh_rng)
+            shape = self._doc.Bookmarks(tag).Range.InlineShapes.AddPicture(
+                FileName=image_path,
+                LinkToFile=False,
+                SaveWithDocument=True,
+            )
+            _fit(shape)
+            return True
+
+        # ── First sign: find picture CC, delete it, insert at plain range ────
+        for cc in self._doc.ContentControls:
+            if cc.Tag == tag:
+                start = cc.Range.Start
+                cc.Delete(DeleteContents=True)
+                fresh_rng = self._doc.Range(start, start)
+                self._doc.Bookmarks.Add(tag, fresh_rng)
+                shape = self._doc.Bookmarks(tag).Range.InlineShapes.AddPicture(
+                    FileName=image_path,
+                    LinkToFile=False,
+                    SaveWithDocument=True,
+                )
+                _fit(shape)
+                return True
+
         return False
 
     def set_cc_value(self, tag: str, value) -> bool:

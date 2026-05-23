@@ -20,6 +20,10 @@ Commands:
                           -- Embed an image into a picture CC by tag in the latest sample document.
                              Example tags: sig_customer, sig_customer_return, sig_technician,
                                            device_front, damage_photo
+    capture_sig <tag> <job_doc_path>
+                          -- Open a signature-capture window (Wacom tablet or mouse).
+                             On Accept, embeds the PNG directly into the named CC in the job doc.
+                             Example: capture_sig sig_customer jobs/2026-023_jane-smith.docx
 
 Customer onboarding checklist: docs/intake_workflow.md
 """
@@ -31,11 +35,86 @@ import sys
 
 _log = lambda msg: print(msg, flush=True)
 
+
+def _install_and_import(package: str, pip_name: str = None):
+    """Import *package*, installing via pip if absent. Returns the module."""
+    import importlib as _il
+    import subprocess as _sp
+    try:
+        return _il.import_module(package)
+    except ImportError:
+        _log(f"installing {pip_name or package} ...")
+        _sp.check_call(
+            [sys.executable, "-m", "pip", "install", pip_name or package],
+            stdout=_sp.DEVNULL,
+        )
+        return _il.import_module(package)
+
+
+def _inject_picture_into_cc(doc_path: str, tag: str, image_path: str) -> bool:
+    """Insert an image into a picture CC by direct docx XML manipulation.
+
+    Bypasses Word COM's AddPicture guard.  The document must NOT be open
+    in Word when this is called (Windows holds a write lock on open docs).
+    Returns True if the tag was found and the image was injected.
+    """
+    import copy
+    docx_mod = _install_and_import("docx", "python-docx")
+    from docx.oxml.ns import qn as _qn
+    from lxml import etree as _et
+
+    d = docx_mod.Document(doc_path)
+
+    # Add the image via a temporary paragraph so python-docx handles
+    # all relationship / image-part plumbing for us.
+    tmp_para = d.add_paragraph()
+    tmp_run  = tmp_para.add_run()
+    tmp_run.add_picture(image_path)
+    drawing_elem = tmp_run._element.find(_qn("w:drawing"))
+    if drawing_elem is None:
+        d.element.body.remove(tmp_para._element)
+        return False
+    drawing_copy = copy.deepcopy(drawing_elem)
+    d.element.body.remove(tmp_para._element)
+
+    # Find the SDT by tag (searches whole body tree inc. table cells).
+    target_sdt = None
+    for sdt in d.element.body.iter(_qn("w:sdt")):
+        sdt_pr = sdt.find(_qn("w:sdtPr"))
+        if sdt_pr is not None:
+            tag_elem = sdt_pr.find(_qn("w:tag"))
+            if tag_elem is not None and tag_elem.get(_qn("w:val")) == tag:
+                target_sdt = sdt
+                break
+    if target_sdt is None:
+        return False
+
+    # Remove 'showingPlcHdr' flag so Word shows content, not placeholder.
+    sdt_pr = target_sdt.find(_qn("w:sdtPr"))
+    if sdt_pr is not None:
+        plc = sdt_pr.find(_qn("w:showingPlcHdr"))
+        if plc is not None:
+            sdt_pr.remove(plc)
+
+    # Replace sdtContent with a paragraph containing the drawing.
+    old_content = target_sdt.find(_qn("w:sdtContent"))
+    if old_content is not None:
+        target_sdt.remove(old_content)
+    sdt_content = _et.SubElement(target_sdt, _qn("w:sdtContent"))
+    p_elem      = _et.SubElement(sdt_content, _qn("w:p"))
+    r_elem      = _et.SubElement(p_elem, _qn("w:r"))
+    r_elem.append(drawing_copy)
+
+    d.save(doc_path)
+    return True
+
+
 REPO_ROOT     = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(REPO_ROOT, "templates")
 JOBS_DIR      = os.path.join(REPO_ROOT, "jobs")
 STATE_JSON    = os.path.join(REPO_ROOT, "state.json")
 CUSTOMERS_TSV = os.path.join(REPO_ROOT, "customers.tsv")
+JOBS_TSV      = os.path.join(REPO_ROOT, "jobs.tsv")
 DEFAULT_TEMPLATE = os.path.join(
     TEMPLATES_DIR, "Nielsoln_Device_Intake_Diagnostic_Consent_Form.docx"
 )
@@ -333,6 +412,105 @@ def _next_job_number() -> str:
         json.dump(state, fh)
     _log(f"  [job claim] {job_id} claimed locally")
     return job_id
+
+
+def _github_claim_next_customer(github_repo: str, github_token: str, max_retries: int = 5) -> str:
+    """Atomically claim the next customer ID via GitHub Contents API.
+
+    Same optimistic-locking approach as _github_claim_next_job.
+    Returns e.g. 'C-001'.
+    """
+    import base64
+    import json
+    import time
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.github.com/repos/{github_repo}/contents/state.json"
+    headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "nielsoln_customers",
+    }
+
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(url, headers=headers)
+        current_sha = None
+        state = None
+        try:
+            with urllib.request.urlopen(req) as resp:
+                file_data = json.loads(resp.read())
+            current_sha = file_data["sha"]
+            state = json.loads(base64.b64decode(file_data["content"]))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                state = {}
+            else:
+                raise
+
+        state.setdefault("last_customer_id", 0)
+        state["last_customer_id"] += 1
+        cid = f"C-{state['last_customer_id']:03d}"
+
+        put_body = {
+            "message": f"claim customer {cid}",
+            "content": base64.b64encode(
+                json.dumps(state, separators=(",", ":")).encode()
+            ).decode(),
+        }
+        if current_sha is not None:
+            put_body["sha"] = current_sha
+        payload = json.dumps(put_body).encode()
+        put_req = urllib.request.Request(
+            url, data=payload, headers={**headers, "Content-Type": "application/json"},
+            method="PUT",
+        )
+        try:
+            with urllib.request.urlopen(put_req):
+                pass
+            _log(f"  [customer claim] {cid} claimed via GitHub (attempt {attempt})")
+            return cid
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409 and attempt < max_retries:
+                _log(f"  [customer claim] conflict on attempt {attempt}, retrying...")
+                time.sleep(0.5 * attempt)
+                continue
+            raise
+
+    raise RuntimeError(f"Failed to claim customer ID after {max_retries} attempts")
+
+
+def _next_customer_id() -> str:
+    """Claim the next customer ID.
+
+    Uses GitHub Contents API if GITHUB_TOKEN is configured, otherwise local
+    state.json fallback.
+    Returns e.g. 'C-001'.
+    """
+    import json
+
+    cfg   = _load_locals()
+    token = cfg.get("GITHUB_TOKEN", "").strip()
+    repo  = cfg.get("GITHUB_REPO", "").strip() or _detect_github_repo()
+
+    if token and repo and not token.startswith("ghp_xxx"):
+        return _github_claim_next_customer(repo, token)
+
+    _log("  [customer claim] GITHUB_TOKEN/GITHUB_REPO not configured — using local state.json")
+    try:
+        with open(STATE_JSON, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        state = {}
+
+    state.setdefault("last_customer_id", 0)
+    state["last_customer_id"] += 1
+    cid = f"C-{state['last_customer_id']:03d}"
+
+    with open(STATE_JSON, "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+    _log(f"  [customer claim] {cid} claimed locally")
+    return cid
 
 
 # ---------------------------------------------------------------------------
@@ -735,27 +913,68 @@ def _cmd_next_job(args: list) -> int:
         return 1
 
 
-def _append_customer_tsv(data: dict) -> None:
-    """Append one row to customers.tsv for the just-onboarded customer.
+_CUSTOMERS_TSV_COLUMNS = ["customer_id", "customer_name", "phone", "email", "address_notes"]
+_JOBS_TSV_COLUMNS = [
+    "job_number", "customer_id", "date_received", "brand_model",
+    "serial_number", "asset_tag", "received_by", "time_received",
+]
 
-    Creates the file with a header row if it does not exist.
-    Only the columns defined in _TSV_COLUMNS are written; missing keys
-    are left blank so the column count stays consistent.
+
+def _lookup_customer(data: dict):
+    """Look up a customer in customers.tsv by name, phone, and email.
+
+    Returns (customer_id, conflicts) where:
+      customer_id: str if all three fields match an existing row, else None
+      conflicts:   list of rows where 1 or 2 of the 3 fields match
     """
-    _TSV_COLUMNS = [
-        "job_number", "date_received", "customer_name", "phone", "email",
-        "address_notes", "brand_model", "serial_number", "asset_tag",
-        "received_by", "time_received",
-    ]
     import csv
+    name  = str(data.get("customer_name", "")).strip().lower()
+    phone = str(data.get("phone", "")).strip()
+    email = str(data.get("email", "")).strip().lower()
+
+    if not os.path.exists(CUSTOMERS_TSV) or os.path.getsize(CUSTOMERS_TSV) == 0:
+        return None, []
+
+    conflicts = []
+    with open(CUSTOMERS_TSV, encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            row_name  = row.get("customer_name", "").strip().lower()
+            row_phone = row.get("phone", "").strip()
+            row_email = row.get("email", "").strip().lower()
+            score = (name == row_name) + (phone == row_phone) + (email == row_email)
+            if score == 3:
+                return row["customer_id"], []
+            if score >= 1:
+                conflicts.append(row)
+    return None, conflicts
+
+
+def _append_customers_tsv(customer_id: str, data: dict) -> None:
+    """Append one row to customers.tsv for a newly created customer."""
+    import csv
+    row = {k: data.get(k, "") for k in _CUSTOMERS_TSV_COLUMNS}
+    row["customer_id"] = customer_id
     write_header = not os.path.exists(CUSTOMERS_TSV) or os.path.getsize(CUSTOMERS_TSV) == 0
     with open(CUSTOMERS_TSV, "a", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=_TSV_COLUMNS, delimiter="\t",
-                                extrasaction="ignore")
+        writer = csv.DictWriter(fh, fieldnames=_CUSTOMERS_TSV_COLUMNS, delimiter="\t")
         if write_header:
             writer.writeheader()
-        writer.writerow({k: data.get(k, "") for k in _TSV_COLUMNS})
-    _log(f"  customers.tsv: row appended for job {data.get('job_number', '?')}")
+        writer.writerow(row)
+    _log(f"  customers.tsv: {customer_id} added ({data.get('customer_name', '?')})")
+
+
+def _append_jobs_tsv(customer_id: str, data: dict) -> None:
+    """Append one row to jobs.tsv for the just-created job."""
+    import csv
+    row = {k: data.get(k, "") for k in _JOBS_TSV_COLUMNS}
+    row["customer_id"] = customer_id
+    write_header = not os.path.exists(JOBS_TSV) or os.path.getsize(JOBS_TSV) == 0
+    with open(JOBS_TSV, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_JOBS_TSV_COLUMNS, delimiter="\t")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    _log(f"  jobs.tsv: row appended for job {data.get('job_number', '?')}")
 
 
 def _cmd_onboard_customer(args: list) -> int:
@@ -790,6 +1009,15 @@ def _cmd_onboard_customer(args: list) -> int:
     job_number    = str(data.get("job_number", "job")).strip()
     customer_name = str(data.get("customer_name", "customer")).strip()
     slug = _job_slug(job_number, customer_name)
+
+    # ── Customer dedup check (before creating any files) ─────────────────────
+    customer_id, conflicts = _lookup_customer(data)
+    if conflicts:
+        _log("  WARNING: partial customer match — manual review required:")
+        for c in conflicts:
+            _log(f"    {c}")
+        _log("  Onboarding aborted. Resolve customer identity before proceeding.")
+        return 1
 
     os.makedirs(JOBS_DIR, exist_ok=True)
     dst = os.path.join(JOBS_DIR, f"{slug}.docx")
@@ -827,7 +1055,166 @@ def _cmd_onboard_customer(args: list) -> int:
     finally:
         driver.detach()
 
-    _append_customer_tsv(data)
+    # ── Write TSVs ────────────────────────────────────────────────────────────
+    if customer_id:
+        _log(f"  customers.tsv: existing customer {customer_id}")
+    else:
+        customer_id = _next_customer_id()
+        _append_customers_tsv(customer_id, data)
+    _append_jobs_tsv(customer_id, data)
+    return 0
+
+
+def _cmd_capture_sig(args: list) -> int:
+    """Capture a handwritten signature and embed it into a job document.
+
+    Usage: capture_sig <tag> <job_doc_path>
+
+    Opens a maximised drawing canvas.  The customer signs with the Wacom pen or
+    mouse.  "Clear" resets the canvas.  "Cancel" closes without saving.
+    "Accept" saves the strokes as a PNG (temp file) and embeds it into the
+    named picture CC in the job document.
+
+    Requires Pillow (auto-installed on first run).
+    """
+    import ctypes
+    import ctypes.wintypes
+    import tempfile
+    import tkinter as tk
+
+    if len(args) < 2:
+        _log("Usage: capture_sig <tag> <job_doc_path>")
+        return 1
+    tag, doc_path = args[0], args[1]
+    if not os.path.exists(doc_path):
+        _log(f"ERROR: document not found: {doc_path}")
+        return 1
+
+    PIL_Image     = _install_and_import("PIL.Image",     "Pillow")
+    PIL_ImageDraw = _install_and_import("PIL.ImageDraw", "Pillow")
+
+    result = {"path": None}
+
+    # ── ClipCursor helpers — confine tablet/mouse to the canvas screen rect ─
+    def _lock_cursor_to_canvas():
+        """Restrict all cursor movement to the full Tkinter window."""
+        root.update_idletasks()
+        x = root.winfo_rootx()
+        y = root.winfo_rooty()
+        rect = ctypes.wintypes.RECT(x, y, x + root.winfo_width(),
+                                    y + root.winfo_height())
+        ctypes.windll.user32.ClipCursor(ctypes.byref(rect))
+
+    def _unlock_cursor():
+        """Remove cursor confinement."""
+        ctypes.windll.user32.ClipCursor(None)
+
+    # ── Bootstrap root to measure maximised dimensions ──────────────────────
+    root = tk.Tk()
+    root.title(f"Sign here  —  {tag}")
+    root.state("zoomed")   # maximise (keeps title bar + taskbar)
+    root.bind_class("Button", "<Return>", lambda e: e.widget.invoke())
+    root.update()          # process geometry so winfo_width/height are valid
+
+    BTN_H = 52             # approximate height of the button row
+    W = root.winfo_width()
+    H = root.winfo_height() - BTN_H
+
+    pil_img  = PIL_Image.new("RGB", (W, H), "white")
+    pil_draw = PIL_ImageDraw.Draw(pil_img)
+
+    canvas = tk.Canvas(root, width=W, height=H, bg="white", cursor="crosshair",
+                       highlightthickness=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
+
+    # Dashed baseline — sits 60 px above the bottom of the canvas
+    canvas.create_line(40, H - 60, W - 40, H - 60, fill="#cccccc", dash=(6, 4))
+
+    # Lock cursor once the canvas is fully laid out
+    root.after(100, _lock_cursor_to_canvas)
+
+    prev = {}
+
+    def on_press(event):
+        prev["x"], prev["y"] = event.x, event.y
+
+    def on_drag(event):
+        x0, y0 = prev.get("x", event.x), prev.get("y", event.y)
+        x1, y1 = event.x, event.y
+        canvas.create_line(x0, y0, x1, y1, width=3, fill="black",
+                           capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        pil_draw.line([(x0, y0), (x1, y1)], fill="black", width=3)
+        prev["x"], prev["y"] = x1, y1
+
+    def on_clear():
+        canvas.delete("all")
+        canvas.create_line(40, H - 60, W - 40, H - 60, fill="#cccccc", dash=(6, 4))
+        pil_draw.rectangle([0, 0, W, H], fill="white")
+
+    def on_cancel():
+        _unlock_cursor()
+        root.destroy()
+
+    def on_accept():
+        _unlock_cursor()
+        # Crop to the bounding box of non-white (ink) pixels, with a small margin.
+        gray = pil_img.convert("L")
+        # Invert relative to threshold: white bg → 0, ink strokes → 255
+        mask = gray.point(lambda p: 0 if p > 240 else 255)
+        bbox = mask.getbbox()
+        if bbox:
+            pad = 12
+            iw, ih = pil_img.size
+            bbox = (max(0, bbox[0] - pad), max(0, bbox[1] - pad),
+                    min(iw, bbox[2] + pad), min(ih, bbox[3] + pad))
+            img_to_save = pil_img.crop(bbox)
+        else:
+            img_to_save = pil_img   # blank canvas — save as-is
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        tmp.close()
+        img_to_save.save(tmp.name)
+        result["path"] = tmp.name
+        root.destroy()
+
+    # Safety net: always unlock if the window is destroyed by any other means
+    root.bind("<Destroy>", lambda _e: _unlock_cursor())
+
+    canvas.bind("<ButtonPress-1>", on_press)
+    canvas.bind("<B1-Motion>",     on_drag)
+
+    btn_frame = tk.Frame(root, pady=4)
+    btn_frame.pack(fill=tk.X, side=tk.BOTTOM)
+    tk.Button(btn_frame, text="Cancel", command=on_cancel, width=12,
+              bg="#e53935", fg="white", font=("Segoe UI", 11)).pack(
+        side=tk.LEFT, padx=12)
+    tk.Button(btn_frame, text="Clear",  command=on_clear,  width=12,
+              font=("Segoe UI", 11)).pack(side=tk.LEFT, padx=4)
+    tk.Button(btn_frame, text="Accept", command=on_accept, width=12,
+              bg="#4caf50", fg="white", font=("Segoe UI", 11, "bold")).pack(
+        side=tk.RIGHT, padx=12)
+
+    root.mainloop()
+
+    if not result["path"]:
+        _log("  Signature capture cancelled (window closed without Accept).")
+        return 0
+
+    _log(f"  Signature PNG: {result['path']}")
+
+    driver = word_tools.WordDriver(document_path=doc_path)
+    driver.open()
+    try:
+        ok = driver.insert_picture_at_tag(tag, result["path"])
+        if ok:
+            _log(f"  picture {tag!r}: embedded")
+        else:
+            _log(f"  picture {tag!r}: CC/bookmark NOT FOUND — PNG at {result['path']}")
+            return 1
+        driver.save()
+        _log(f"Saved: {doc_path}")
+    finally:
+        driver.detach()
+
     return 0
 
 
@@ -838,6 +1225,7 @@ COMMANDS = {
     "insert_picture":    _cmd_insert_picture,
     "next_job":          _cmd_next_job,
     "onboard_customer":  _cmd_onboard_customer,
+    "capture_sig":       _cmd_capture_sig,
 }
 
 
