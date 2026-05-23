@@ -24,6 +24,8 @@ sys.argv[1:] = ["build_template"] ; import runpy ; temp = runpy._run_module_as_m
 
 Available commands: `scan`, `build_template`, `fill_sample`, `insert_picture`, `next_job`, `onboard_customer`
 
+See **`docs/intake_workflow.md`** for the step-by-step customer onboarding checklist.
+
 ## Repo Structure
 
 ```

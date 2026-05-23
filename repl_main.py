@@ -20,6 +20,8 @@ Commands:
                           -- Embed an image into a picture CC by tag in the latest sample document.
                              Example tags: sig_customer, sig_customer_return, sig_technician,
                                            device_front, damage_photo
+
+Customer onboarding checklist: docs/intake_workflow.md
 """
 
 import contextlib
@@ -33,6 +35,7 @@ REPO_ROOT     = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(REPO_ROOT, "templates")
 JOBS_DIR      = os.path.join(REPO_ROOT, "jobs")
 STATE_JSON    = os.path.join(REPO_ROOT, "state.json")
+CUSTOMERS_TSV = os.path.join(REPO_ROOT, "customers.tsv")
 DEFAULT_TEMPLATE = os.path.join(
     TEMPLATES_DIR, "Nielsoln_Device_Intake_Diagnostic_Consent_Form.docx"
 )
@@ -732,6 +735,29 @@ def _cmd_next_job(args: list) -> int:
         return 1
 
 
+def _append_customer_tsv(data: dict) -> None:
+    """Append one row to customers.tsv for the just-onboarded customer.
+
+    Creates the file with a header row if it does not exist.
+    Only the columns defined in _TSV_COLUMNS are written; missing keys
+    are left blank so the column count stays consistent.
+    """
+    _TSV_COLUMNS = [
+        "job_number", "date_received", "customer_name", "phone", "email",
+        "address_notes", "brand_model", "serial_number", "asset_tag",
+        "received_by", "time_received",
+    ]
+    import csv
+    write_header = not os.path.exists(CUSTOMERS_TSV) or os.path.getsize(CUSTOMERS_TSV) == 0
+    with open(CUSTOMERS_TSV, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=_TSV_COLUMNS, delimiter="\t",
+                                extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow({k: data.get(k, "") for k in _TSV_COLUMNS})
+    _log(f"  customers.tsv: row appended for job {data.get('job_number', '?')}")
+
+
 def _cmd_onboard_customer(args: list) -> int:
     """Fill a new intake form from a JSON data file.
 
@@ -800,6 +826,8 @@ def _cmd_onboard_customer(args: list) -> int:
         _log(f"Saved: {dst}")
     finally:
         driver.detach()
+
+    _append_customer_tsv(data)
     return 0
 
 
